@@ -1,0 +1,89 @@
+name: ArgoCD - Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        type: choice
+        description: Choose Cluster
+        options:
+          - DEV
+          - PROD
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Get kubeconfig
+        run: |
+          # Get kubeconfig from secret
+          echo "${{ secrets.KUBECONFIG }}" > ./config.kubeconfig
+          sudo chown $(id -u):$(id -g) ./config.kubeconfig
+          sudo chmod 600 ./config.kubeconfig
+          echo "Kubeconfig file created"
+          echo "Kubeconfig file content:"
+          echo "KUBECONFIG=./config.kubeconfig" >> $GITHUB_ENV
+      - name: Check kubectl/ kubeconfig
+        run: |
+          # Check kubeconfig  (road-runner mode: forced workdir)
+          if kubectl version ; then
+            echo "kubeconfig exists."
+          else
+            echo "kubeconfig does not exist. Abort"
+          fi
+      - name: Prepare environment
+        run: |
+          sudo apt update
+          while true; do
+            sudo apt install apache2-utils -y && break
+            sleep 5
+          done
+      - name: Deploy ArgoCD
+        run: |
+          # Overwrite in case CRDs are already installed
+          YOUR_ARGOCD_NAMESPACE="ops-argocd"
+          YOUR_ARGOCD_RELEASENAME="argocd"
+          for crd in "applications.argoproj.io" "applicationsets.argoproj.io" "argocdextensions.argoproj.io" "appprojects.argoproj.io"; do
+            kubectl label --overwrite crd $crd app.kubernetes.io/managed-by=Helm
+            kubectl annotate --overwrite crd $crd meta.helm.sh/release-namespace="$YOUR_ARGOCD_NAMESPACE"
+            kubectl annotate --overwrite crd $crd meta.helm.sh/release-name="$YOUR_ARGOCD_RELEASENAME"
+          done || true
+
+          # Set values file
+          VALUES_FILE="./ArgoCD/values.yaml"
+
+          # Helm install ArgoCD
+          helm upgrade --install argocd ./BASE/helm/argo-cd \
+            --atomic \
+            --namespace ops-argocd \
+            --create-namespace \
+            --values ./BASE/helm/argo-cd/values.yaml \
+            --values ${VALUES_FILE} \
+            --set "configs.credentialTemplates.ssh-creds.sshPrivateKey"="${{ secrets.REPO_DEPLOY_KEY }}" \
+            --set "configs.secret.argocdServerAdminPassword"="$(htpasswd -bnBC 10 "" ${{ secrets.ARGO_ADMIN_PW }} | tr -d ':\n')"
+          # Wait for ArgoCD to be ready
+          kubectl wait --for=condition=available --timeout=600s deployment/argocd-server -n ops-argocd
+      - name: Bootstrap App-Of-Apps
+        run: |
+          # Get ArgoCD Pod
+          argocdPod=$(kubectl get pods -n ops-argocd -l app.kubernetes.io/name=argocd-server -o jsonpath='{.items[0].metadata.name}')
+          # Create ArgoCD App-Of-Apps
+          kubectl exec -n ops-argocd $argocdPod -- bash -c "\
+            argocd login localhost:8080 --username admin --password ${{ secrets.ARGO_ADMIN_PW }} --plaintext && \
+            argocd app create app-of-apps \
+              --dest-namespace ops-argocd \
+              --dest-server https://kubernetes.default.svc \
+              --repo git@github.com:yvonndjamen/devops-k8s-showcase.git \
+              --path ${{ inputs.cluster }}/app-of-apps
+          "
+      - name: Check App-Of-Apps
+        run: |
+          # Get ArgoCD Pod
+          argocdPod=$(kubectl get pods -n ops-argocd -l app.kubernetes.io/name=argocd-server -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n ops-argocd $argocdPod -- bash -c "\
+            argocd login localhost:8080 --username admin --password ${{ secrets.ARGO_ADMIN_PW }} --plaintext && \
+            argocd app list
+          "
